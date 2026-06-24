@@ -95,6 +95,73 @@ function extractCaptions(diff: string): string[] {
 	return out;
 }
 
+/**
+ * Recompute each hunk's oldLines/newLines from its body and rewrite the `@@`
+ * headers. `diff`'s `parsePatch` validates the header counts against the body
+ * and throws on any mismatch, but the body is authoritative — the LLM can
+ * miscount headers, but it writes the body by copying the actual lines. So we
+ * re-derive the counts before parsing: each body line starting with `-` or ` `
+ * counts toward oldLines; `+` or ` ` counts toward newLines; `\` (EOFNL) is
+ * excluded from both. `oldStart`/`newStart` and the caption are preserved.
+ *
+ * Also re-extracts the caption from the original header so that information is
+ * not lost when we rewrite the line. Returns the rewritten diff string and the
+ * captions (in hunk order).
+ */
+function normalizeHunkCounts(diff: string): { diff: string; captions: string[] } {
+	const hunkRe = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(.*)$/gm;
+	const lines = diff.split("\n");
+	const out: string[] = [];
+	const captions: string[] = [];
+	let i = 0;
+	while (i < lines.length) {
+		const line = lines[i]!;
+		const m = hunkRe.exec(line);
+		if (m) {
+			const oldStart = m[1]!;
+			const newStart = m[3]!;
+			const caption = m[5]!.trim();
+			// Count this hunk's body lines.
+			let oldLines = 0;
+			let newLines = 0;
+			let j = i + 1;
+			for (; j < lines.length; j++) {
+				const body = lines[j]!;
+				if (body.length === 0 && j !== lines.length - 1) {
+					// diff encodes a blank context line as an empty string (the leading
+					// space is stripped by the format). It counts toward both.
+					oldLines++;
+					newLines++;
+					continue;
+				}
+				const op = body[0];
+				if (op === " " || op === "-" || op === "+") {
+					if (op === " " || op === "-") oldLines++;
+					if (op === " " || op === "+") newLines++;
+				} else if (op === "\\") {
+					// "No newline at end of file" marker. It annotates the preceding
+					// `-`/`+` line and is NOT counted toward either total, but it does
+					// not terminate the hunk — a `+` line can follow a `\` marker (and
+					// vice versa) when both sides lack a trailing newline.
+					continue;
+				} else {
+					break; // next hunk header or file header
+				}
+			}
+			captions.push(caption);
+			out.push(`@@ -${oldStart},${oldLines} +${newStart},${newLines} @@${caption ? " " + caption : ""}`);
+			// Copy the body lines verbatim (including any `\` markers).
+			for (let k = i + 1; k < j; k++) out.push(lines[k]!);
+			i = j;
+			hunkRe.lastIndex = 0;
+		} else {
+			out.push(line);
+			i++;
+		}
+	}
+	return { diff: out.join("\n"), captions };
+}
+
 /** 0-based index of the first line whose trimmed content equals trimmed `caption`, or null. */
 function findCaptionLineIn(lines: string[], caption: string): number | null {
 	if (!caption) return null;
@@ -136,9 +203,15 @@ function findFirstContextLineAtOrAfter(lines: string[], hunk: StructuredPatchHun
 export function applyDiff(source: string, diff: string, options: ApplyOptions = {}): ApplyOutcome {
 	const { fuzzFactor = 2, compareLine = DEFAULT_COMPARE_LINE } = options;
 
+	// Recompute hunk line counts from the body before parsing. `diff`'s
+	// `parsePatch` validates counts against the body and throws on mismatch, but
+	// the body is authoritative — the LLM can miscount headers but copies the
+	// actual lines. Also extracts captions (text after `@@`) so we don't re-scan.
+	const { diff: normalized, captions } = normalizeHunkCounts(diff);
+
 	let patches: StructuredPatch[];
 	try {
-		patches = parsePatch(diff);
+		patches = parsePatch(normalized);
 	} catch (err) {
 		return {
 			applied: false,
@@ -163,7 +236,6 @@ export function applyDiff(source: string, diff: string, options: ApplyOptions = 
 		return { applied: true, content: source, hunks: [] };
 	}
 
-	const captions = extractCaptions(diff);
 	const lines = source.split("\n");
 
 	// Single pass: per hunk, find the anchor once (if captioned) and derive both

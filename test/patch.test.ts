@@ -397,11 +397,95 @@ describe("applyDiff — rejection", () => {
 		assert.equal(out.hunks.length, 0);
 	});
 
-	it("catches malformed diffs (hunk count mismatch) as a parse error", () => {
-		const diff = "@@ -1,5 +1,3 @@\n a\n-b\n+B\n c\n"; // oldLines claims 5, only 3 present
+	it("surfaces a parse error for a truly malformed body (line with no op prefix)", () => {
+		// Header count mismatches are normalized away (the body is authoritative),
+		// but a body line that isn't ` `/`-`/`+`/`\` is a genuine structural error
+		// that `parsePatch` still rejects. This pins that we didn't swallow it.
+		const diff = "@@ -1,3 +1,3 @@\n a\nbogus\n-b\n+B\n c\n";
 		const out = applyDiff("a\nb\nc\n", diff);
 
 		assert.equal(out.applied, false);
 		assert.match(out.error ?? "", /Failed to parse diff/);
+	});
+});
+
+describe("applyDiff — line-count normalization", () => {
+	// `diff`'s `parsePatch` validates the `@@ -oldLines,newLines @@` header counts
+	// against the hunk body and throws on any mismatch. LLMs miscount these headers
+	// frequently, but the body is authoritative (the LLM copies the actual lines).
+	// We recompute the counts from the body before parsing so a miscounted header
+	// never reaches the parser. This block pins that behavior.
+
+	it("applies when oldLines is too low (header says 2, body has 3)", () => {
+		const source = "a\nb\nc\n";
+		const diff = "@@ -1,2 +1,3 @@\n a\n-b\n+B\n c\n"; // body: 3 old, 3 new
+		const out = applyDiff(source, diff);
+		assert.equal(out.applied, true);
+		assert.equal(out.content, "a\nB\nc\n");
+	});
+
+	it("applies when oldLines is too high (header says 4, body has 3)", () => {
+		const source = "a\nb\nc\n";
+		const diff = "@@ -1,4 +1,3 @@\n a\n-b\n+B\n c\n";
+		const out = applyDiff(source, diff);
+		assert.equal(out.applied, true);
+		assert.equal(out.content, "a\nB\nc\n");
+	});
+
+	it("applies when newLines is too low (header says 2, body has 3)", () => {
+		const source = "a\nb\nc\n";
+		const diff = "@@ -1,3 +1,2 @@\n a\n-b\n+B\n c\n";
+		const out = applyDiff(source, diff);
+		assert.equal(out.applied, true);
+		assert.equal(out.content, "a\nB\nc\n");
+	});
+
+	it("applies when both counts are too low", () => {
+		const source = "a\nb\nc\n";
+		const diff = "@@ -1,2 +1,2 @@\n a\n-b\n+B\n c\n";
+		const out = applyDiff(source, diff);
+		assert.equal(out.applied, true);
+		assert.equal(out.content, "a\nB\nc\n");
+	});
+
+	it("normalizes counts for a multi-hunk diff where only some headers are wrong", () => {
+		const source = "a\nb\nc\nd\ne\n";
+		const diff = [
+			"@@ -1,2 +1,2 @@", // correct
+			" a",
+			"-b",
+			"+B",
+			"@@ -3,99 +3,99 @@", // wildly wrong counts; body is fine
+			" c",
+			"-d",
+			"+D",
+		].join("\n");
+		const out = applyDiff(source, diff);
+		assert.equal(out.applied, true);
+		assert.equal(out.content, "a\nB\nc\nD\ne\n");
+	});
+
+	it("round-trips a createPatch diff that lacks a trailing newline (EOFNL markers)", () => {
+		// The `\ No newline at end of file` marker annotates the preceding `-`/`+`
+		// line and is NOT counted toward either total, but it does not terminate
+		// the hunk — a `+` line can follow a `\` marker. Normalization must keep
+		// counting past the marker so newLines is correct (3, not 2).
+		const old = "a\nb\nc"; // no trailing newline
+		const next = "a\nb\nC";
+		const diff = createPatch("f", old, next);
+		const out = applyDiff(old, diff);
+		assert.equal(out.applied, true);
+		assert.equal(out.content, next);
+	});
+
+	it("applies a pure-insertion hunk (oldLines=0)", () => {
+		const source = "a\nb\nc\n";
+		// Insert `d` after `c`. diff format: oldStart is one-past the anchor when
+		// oldLines is 0. The header counts (0 and 1) are recomputed from the body
+		// (just a `+` line), so even a wrong oldLines here would be corrected.
+		const diff = "@@ -3,0 +4,1 @@\n+d\n";
+		const out = applyDiff(source, diff);
+		assert.equal(out.applied, true);
+		assert.equal(out.content, "a\nb\nc\nd\n");
 	});
 });
